@@ -8,14 +8,15 @@
 //
 // Implied value follows only from the snapshot's own figures:
 //
-//   base       = tvl_usd x BASE_MULTIPLE
+//   base       = tvl_usd x BASE_MULTIPLE x category_mult x chain_mult
 //   growth     = clamp(change_7d, -60, 120) per cent
 //   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
-//   maturity   = 0.6 + min(age_days, 1095) / 1095 x 0.4   (age_days unknown: 365)
+//   maturity   = 0.55 + min(age_days, 1095) / 1095 x 0.45   (age_days unknown: 300)
 //   implied    = max(1, round(base x growthMult x maturity))
 //
-// The constants are the house model's, stated in the dashboard and changeable in the model sandbox. No
-// protocol name is ever special-cased: the same function scores every row.
+// Category and chain multipliers distinguish sectors: cross-chain and DeFi protocols carry a premium
+// for token-optionality, while bridges and wrapped products score lower since they rarely issue.
+// No protocol name is ever special-cased: the same function scores every row.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -53,18 +54,52 @@ export interface ModelConstants {
 }
 
 export const MODEL: ModelConstants = {
-  base_multiple: 0.25,
-  growth_weight: 0.5,
+  base_multiple: 0.22,
+  growth_weight: 0.6,
   growth_floor: -60,
   growth_cap: 120,
-  maturity_floor: 0.6,
-  maturity_range: 0.4,
+  maturity_floor: 0.55,
+  maturity_range: 0.45,
   maturity_days: 1095,
-  unknown_age_days: 365,
+  unknown_age_days: 300,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-1';
+export const MODEL_VERSION = 'radar-2';
+
+/** Category multipliers: sector-based premium or discount on implied value. */
+export const CATEGORY_MULT: Record<string, number> = {
+  'DApp': 1.10,
+  'DeFi': 1.08,
+  'DEX': 1.06,
+  'Yield': 1.05,
+  'Lending': 1.04,
+  'Bridge': 0.85,
+  'Canonical Bridge': 0.85,
+  'Liquid Staking': 0.90,
+  'Liquid Restaking': 0.90,
+  'Restaked BTC': 0.88,
+  'CEX': 0.80,
+  'Other': 1.00,
+};
+
+/** Chain multipliers: multi-chain protocols score higher for token-optionality. */
+export const CHAIN_MULT: Record<string, number> = {
+  'Ethereum': 1.02,
+  'Bitcoin': 0.95,
+  'Solana': 1.03,
+  'Base': 1.04,
+  'Arbitrum': 1.03,
+  'Optimism': 1.02,
+  'Polygon': 1.02,
+  'Avalanche': 1.01,
+  'Cosmos': 1.03,
+  'Polkadot': 1.01,
+  'Near': 1.02,
+  'Multichain': 1.06,
+  'Cross-chain': 1.07,
+  'Other': 1.00,
+};
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 160;
@@ -100,6 +135,8 @@ export interface BoardRow {
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
+    category_multiplier: number;
+    chain_multiplier: number;
     age_days: number | null;
   };
   farm_steps: string[];
@@ -172,17 +209,36 @@ export function ageDays(asOf: string, listedAt: string | null): number | null {
   return Math.max(0, Math.floor((a - b) / DAY_MS));
 }
 
+/** The category multiplier for one protocol. */
+function categoryMult(p: SnapshotProtocol): number {
+  if (p.category === null) return CATEGORY_MULT['Other'];
+  return CATEGORY_MULT[p.category] ?? CATEGORY_MULT['Other'];
+}
+
+/** The chain multiplier for one protocol: best single chain, premium for multi-chain. */
+function chainMult(p: SnapshotProtocol): number {
+  let best = CHAIN_MULT['Other'];
+  for (const c of p.chains) {
+    const m = CHAIN_MULT[c] ?? CHAIN_MULT['Other'];
+    if (m > best) best = m;
+  }
+  if (p.chains.length > 1) best += 0.02;
+  return best;
+}
+
 /** The three multipliers and the implied value one protocol gets under `model`. */
-export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants): { implied: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
+export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: ModelConstants): { implied: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null; catMult: number; chainMultVal: number } {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const base = protocol.tvl_usd * model.base_multiple;
+  const catM = categoryMult(protocol);
+  const chainM = chainMult(protocol);
+  const base = protocol.tvl_usd * model.base_multiple * catM * chainM;
   const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
-  return { implied, growthPct, growthMult, maturityMult, age };
+  return { implied, growthPct, growthMult, maturityMult, age, catMult: catM, chainMultVal: chainM };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -230,8 +286,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const { implied, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model);
-    return { p, implied, growthPct, growthMult, maturityMult, age };
+    const { implied, growthPct, growthMult, maturityMult, age, catMult, chainMultVal } = impliedValue(p, snapshot.as_of, model);
+    return { p, implied, growthPct, growthMult, maturityMult, age, catMult, chainMultVal };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
@@ -254,6 +310,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
+      category_multiplier: round4(s.catMult),
+      chain_multiplier: round4(s.chainMultVal),
       age_days: s.age,
     },
     farm_steps: farmSteps(s.p, s.age).map(stepText),
