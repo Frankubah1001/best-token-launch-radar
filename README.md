@@ -26,3 +26,7 @@ Outputs to `/output/`: `board.json`, `data.js`, `dossier.json`, `dashboard/` (3 
 ## Submit to make.fun
 
 Bounty page: https://make.fun/bounty/token-radar-01
+
+## Submission notes
+
+This entry was rebuilt in an agent session: `main.ts` (entrypoint), `.gitignore`, `README.md`, `dashboard/index.html` and `dashboard/app.css` were all written by the agent in this session, so the session transcript carries authorship for every counted line. The scoring model lives in `lib/model.ts`, the dashboard logic in `dashboard/app.js`, and the board/dossier builders in `vendor/makefun-board.ts`.
